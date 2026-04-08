@@ -11,7 +11,7 @@ import streamlit as st
 
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
-LIBRARY_PATH = DATA_DIR / "content_library_v2.csv"
+LIBRARY_PATH = DATA_DIR / "content_library_expanded.csv"
 DB_PATH = DATA_DIR / "daily_edge_v2.db"
 
 st.set_page_config(page_title="Daily Edge V2", page_icon="🧠", layout="wide")
@@ -45,10 +45,10 @@ CATEGORY_WEIGHTS = {
 def resolve_library_path() -> Path | None:
     candidates = [
         LIBRARY_PATH,
-        APP_DIR / "content_library_v2.csv",
-        APP_DIR / "data" / "content_library.csv",
-        Path.cwd() / "data" / "content_library_v2.csv",
-        Path.cwd() / "content_library_v2.csv",
+        APP_DIR / "content_library_expanded.csv",
+        APP_DIR / "data" / "content_library_expanded.csv",
+        Path.cwd() / "data" / "content_library_expanded.csv",
+        Path.cwd() / "content_library_expanded.csv",
     ]
     for path in candidates:
         if path.exists():
