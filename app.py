@@ -9,10 +9,8 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-APP_DIR = Path(__file__).parent
-DATA_DIR = APP_DIR / "data"
-LIBRARY_PATH = DATA_DIR / "content_library_expanded.csv"
-DB_PATH = DATA_DIR / "daily_edge_v2.db"
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "daily_edge_v2.db"
 
 st.set_page_config(page_title="Daily Edge V2", page_icon="🧠", layout="wide")
 
@@ -42,22 +40,50 @@ CATEGORY_WEIGHTS = {
 }
 
 
-def resolve_library_path() -> Path | None:
-    candidates = [
-        LIBRARY_PATH,
+def normalize_name(name: str) -> str:
+    return (
+        name.lower()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+
+def resolve_library_path() -> Optional[Path]:
+    candidates = []
+
+    # direct likely files
+    direct_paths = [
         APP_DIR / "content_library_expanded.csv",
+        APP_DIR / "content_library_extended.csv",
+        APP_DIR / "content_library _extended.csv",
+        APP_DIR / "content_library.csv",
         APP_DIR / "data" / "content_library_expanded.csv",
-        Path.cwd() / "data" / "content_library_expanded.csv",
-        Path.cwd() / "content_library_expanded.csv",
+        APP_DIR / "data" / "content_library_extended.csv",
+        APP_DIR / "data" / "content_library _extended.csv",
+        APP_DIR / "data" / "content_library.csv",
     ]
-    for path in candidates:
-        if path.exists():
-            return path
-    return None
+
+    for p in direct_paths:
+        if p.exists():
+            candidates.append(p)
+
+    # recursive search in repo
+    for p in APP_DIR.rglob("*.csv"):
+        n = normalize_name(p.name)
+        if "contentlibrary" in n or ("library" in n and "content" in n):
+            candidates.append(p)
+
+    if not candidates:
+        return None
+
+    # prefer the largest file, which is usually the expanded library
+    candidates = list(dict.fromkeys(candidates))
+    candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+    return candidates[0]
 
 
 def get_connection() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -93,26 +119,62 @@ def load_library() -> pd.DataFrame:
     else:
         df = pd.read_csv(StringIO(EMBEDDED_LIBRARY_CSV))
 
+    # normalize column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # support alternate old column names
+    rename_map = {
+        "core_statement": "claim",
+        "phrase": "claim",
+        "statement": "claim",
+        "why_it_matters": "summary",
+        "description": "summary",
+        "takeaway": "practical_takeaway",
+        "reflection": "reflection_prompt",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
     required_defaults = {
+        "id": "",
+        "title": "",
+        "category": "General",
+        "subcategory": "General",
+        "claim": "",
+        "summary": "",
+        "mechanism": "",
+        "evidence_strength": "",
+        "evidence_type": "",
         "limitations": "",
         "skeptical_view": "",
+        "practical_takeaway": "",
+        "reflection_prompt": "",
         "related_topics": "",
+        "estimated_minutes": 10,
+        "difficulty": "practical",
         "source_1_title": "",
         "source_1_url": "",
         "source_1_type": "",
         "source_2_title": "",
         "source_2_url": "",
         "source_2_type": "",
+        "source_3_title": "",
+        "source_3_url": "",
+        "source_3_type": "",
     }
+
     for col, default in required_defaults.items():
         if col not in df.columns:
             df[col] = default
         df[col] = df[col].fillna(default)
 
-    if "estimated_minutes" not in df.columns:
-        df["estimated_minutes"] = 10
-    if "difficulty" not in df.columns:
-        df["difficulty"] = "practical"
+    # create fallback ids if missing
+    if (df["id"] == "").any():
+        missing_mask = df["id"] == ""
+        df.loc[missing_mask, "id"] = [f"AUTO{i+1:04d}" for i in range(missing_mask.sum())]
+
+    # drop fully empty rows
+    df = df[~((df["title"] == "") & (df["claim"] == "") & (df["mechanism"] == ""))].copy()
+
     return df
 
 
@@ -182,11 +244,13 @@ def select_today_card(library: pd.DataFrame, history: pd.DataFrame) -> pd.Series
     todays_rows = history[history["shown_at"] == today_key]
     if not todays_rows.empty:
         card_id = todays_rows.iloc[0]["card_id"]
-        return library.loc[library["id"] == card_id].iloc[0]
+        existing = library.loc[library["id"] == card_id]
+        if not existing.empty:
+            return existing.iloc[0]
 
     prefs = compute_preferences(library, history)
     due_revisits = get_due_revisits(history)
-    recent_categories: list[str] = []
+    recent_categories = []
     if not history.empty:
         merged_recent = history.merge(library[["id", "category"]], left_on="card_id", right_on="id", how="left")
         recent_categories = merged_recent.head(3)["category"].dropna().tolist()
@@ -228,15 +292,25 @@ def source_rows(card: pd.Series) -> list[tuple[str, str, str]]:
 
 
 def render_today_card(card: pd.Series) -> None:
+    claim = str(card.get("claim", "") or "").strip()
+    summary = str(card.get("summary", "") or "").strip()
+
+    if not claim:
+        claim = "No claim field found for this card yet."
+    if not summary:
+        summary = "No summary added yet."
+
     st.markdown(
         f"""
         <div style='padding:1rem 1.1rem;border:1px solid #e5e7eb;border-radius:16px;background:#fafafa;'>
             <div style='font-size:0.9rem;color:#475569;margin-bottom:0.4rem;'>{card['category']} · {card['subcategory']} · {card['estimated_minutes']} min</div>
             <div style='font-size:1.6rem;font-weight:700;margin-bottom:0.7rem;'>{card['title']}</div>
-            <div style='font-size:1.05rem;line-height:1.6;margin-bottom:0.9rem;'><strong>Claim:</strong> {card['claim']}</div>
-            <div style='line-height:1.65;margin-bottom:0.9rem;'><strong>Why it matters:</strong> {card['summary']}</div>
-            <div><span style='padding:0.25rem 0.55rem;border-radius:999px;background:#ecfeff;color:#155e75;font-size:0.82rem;font-weight:600;'>Evidence: {card['evidence_strength']}</span>
-            <span style='padding:0.25rem 0.55rem;border-radius:999px;background:#f8fafc;color:#334155;font-size:0.82rem;font-weight:600;margin-left:0.35rem;'>{card['evidence_type']}</span></div>
+            <div style='font-size:1.05rem;line-height:1.6;margin-bottom:0.9rem;'><strong>Claim:</strong> {claim}</div>
+            <div style='line-height:1.65;margin-bottom:0.9rem;'><strong>Why it matters:</strong> {summary}</div>
+            <div>
+                <span style='padding:0.25rem 0.55rem;border-radius:999px;background:#ecfeff;color:#155e75;font-size:0.82rem;font-weight:600;'>Evidence: {card['evidence_strength']}</span>
+                <span style='padding:0.25rem 0.55rem;border-radius:999px;background:#f8fafc;color:#334155;font-size:0.82rem;font-weight:600;margin-left:0.35rem;'>{card['evidence_type']}</span>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -245,7 +319,7 @@ def render_today_card(card: pd.Series) -> None:
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Mechanism", "Sources", "Limitations", "Related topics", "Apply it"])
 
     with tab1:
-        st.write(card["mechanism"])
+        st.write(card["mechanism"] or "Not filled yet.")
     with tab2:
         rows = source_rows(card)
         if rows:
@@ -270,9 +344,9 @@ def render_today_card(card: pd.Series) -> None:
             st.info("No related topics added yet.")
     with tab5:
         st.markdown("**Practical takeaway**")
-        st.write(card["practical_takeaway"])
+        st.write(card["practical_takeaway"] or "Not filled yet.")
         st.markdown("**Reflection prompt**")
-        st.info(card["reflection_prompt"])
+        st.info(card["reflection_prompt"] or "Not filled yet.")
 
 
 def sidebar_stats(library: pd.DataFrame, history: pd.DataFrame) -> None:
@@ -283,8 +357,15 @@ def sidebar_stats(library: pd.DataFrame, history: pd.DataFrame) -> None:
     st.sidebar.metric("Completed sessions", int(history["completed"].sum()) if not history.empty else 0)
     if not history.empty and history["rating"].notna().any():
         st.sidebar.metric("Average rating", round(float(history["rating"].dropna().mean()), 2))
+
+    resolved = resolve_library_path()
     st.sidebar.markdown("---")
-    st.sidebar.write("This version uses SQLite for quick private prototyping. For durable cloud memory later, move to Supabase or another hosted database.")
+    st.sidebar.write(f"Library file: `{resolved.name if resolved else 'embedded starter library'}`")
+    st.sidebar.write(f"Database file: `{DB_PATH.name}`")
+
+    if st.sidebar.button("Clear app cache"):
+        st.cache_data.clear()
+        st.rerun()
 
 
 def main() -> None:
@@ -352,9 +433,9 @@ def main() -> None:
             filtered = filtered[filtered["category"] == selected_category]
         if search_term:
             mask = (
-                filtered["title"].str.contains(search_term, case=False, na=False)
-                | filtered["claim"].str.contains(search_term, case=False, na=False)
-                | filtered["related_topics"].str.contains(search_term, case=False, na=False)
+                filtered["title"].astype(str).str.contains(search_term, case=False, na=False)
+                | filtered["claim"].astype(str).str.contains(search_term, case=False, na=False)
+                | filtered["related_topics"].astype(str).str.contains(search_term, case=False, na=False)
             )
             filtered = filtered[mask]
 
@@ -384,7 +465,7 @@ def main() -> None:
         st.subheader("How to develop the library")
         st.markdown(
             """
-            Build **15–20 excellent cards first**, not 200 average ones.
+            Build 15–20 excellent cards first, not 200 average ones.
 
             Each good card should include:
             - one precise claim
@@ -397,21 +478,8 @@ def main() -> None:
             - one practical takeaway
             - one reflection prompt
             - a few related topics
-
-            A useful rule is to keep a card in the main rotation only if it scores well on:
-            - clarity
-            - usefulness
-            - source quality
-            - honesty about limitations
-            - practical relevance
             """
         )
-        st.code(
-            """Recommended CSV columns:
-id,title,category,subcategory,claim,summary,mechanism,evidence_strength,evidence_type,limitations,skeptical_view,practical_takeaway,reflection_prompt,related_topics,estimated_minutes,difficulty,source_1_title,source_1_url,source_1_type,source_2_title,source_2_url,source_2_type""",
-            language="text",
-        )
-
 
 if __name__ == "__main__":
     main()
